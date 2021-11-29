@@ -3810,6 +3810,18 @@ JoinTable:
 		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), Tp: ast.CrossJoin}
 	}
 	/* Your code here. */
+	/*从左到右一次对应各个参数，具体含义可参考dml.go里的join结构体,此时5个参数*/
+| TableRef CrossOpt TableRef "ON" Expression
+  {
+    on := &ast.OnCondition{Expr: $5}
+    $$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), Tp: ast.CrossJoin, On: on}
+  }
+  /*7个参数,各个参数的含义可参考下面的内容*/
+| TableRef JoinType OuterOpt "JOIN" TableRef "ON" Expression
+  {
+    on := &ast.OnCondition{Expr: $7}
+    $$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $5.(ast.ResultSetNode), Tp: $2.(ast.JoinType), On: on}
+  }
 
 JoinType:
 	"LEFT"
@@ -4074,7 +4086,7 @@ HintStorageTypeAndTable:
 			Tables:    $3.([]ast.HintTable),
 		}
 	}
-	
+
 QueryBlockOpt:
 	{
 		$$ = model.NewCIStr("")
