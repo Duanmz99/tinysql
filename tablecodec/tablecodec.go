@@ -72,6 +72,28 @@ func EncodeRowKeyWithHandle(tableID int64, handle int64) kv.Key {
 // DecodeRecordKey decodes the key and gets the tableID, handle.
 func DecodeRecordKey(key kv.Key) (tableID int64, handle int64, err error) {
 	/* Your code here */
+	// tablePrefix_tableID_recordPrefixSep_rowID(handle)
+	k := key
+	if !key.HasPrefix(tablePrefix) {
+		err = errInvalidKey.GenWithStack("invalid key - %q", k)
+		return
+	}
+	key = key[len(tablePrefix):]
+	key, tableID, err = codec.DecodeInt(key)
+	if err != nil {
+		err = errors.Trace(err)
+		return
+	}
+	if !key.HasPrefix(recordPrefixSep) {
+		err = errInvalidKey.GenWithStack("invalid key - %q", k)
+		return
+	}
+	key = key[len(recordPrefixSep):]
+	key, handle, err = codec.DecodeInt(key)
+	if err != nil {
+		err = errors.Trace(err)
+		return
+	}
 	return
 }
 
@@ -95,6 +117,17 @@ func EncodeIndexSeekKey(tableID int64, idxID int64, encodedValue []byte) kv.Key 
 // DecodeIndexKeyPrefix decodes the key and gets the tableID, indexID, indexValues.
 func DecodeIndexKeyPrefix(key kv.Key) (tableID int64, indexID int64, indexValues []byte, err error) {
 	/* Your code here */
+	k := key
+	tableID, indexID, isRecord, err := DecodeKeyHead(key)
+	if err != nil {
+		return 0, 0, nil, errors.Trace(err)
+	}
+	if isRecord {
+		err = errInvalidIndexKey.GenWithStack("invalid index key - %q", k)
+		return 0, 0, nil, err
+	}
+	indexValues = key[prefixLen+idLen:]
+
 	return tableID, indexID, indexValues, nil
 }
 
@@ -138,7 +171,6 @@ func DecodeValuesBytesToStrings(b []byte) ([]string, error) {
 	}
 	return datumValues, nil
 }
-
 
 // EncodeRow encode row data and column ids into a slice of byte.
 // Row layout: colID1, value1, colID2, value2, .....
@@ -217,9 +249,11 @@ func DecodeKeyHead(key kv.Key) (tableID int64, indexID int64, isRecordKey bool, 
 		err = errors.Trace(err)
 		return
 	}
-
+	// 这个函数同时判断tableKey和indexKey
+	// 如果是tableKey这里会直接结束
 	if key.HasPrefix(recordPrefixSep) {
 		isRecordKey = true
+		// 之所以直接return而无需返回四个是因为返回列表写了变量名，对应返回
 		return
 	}
 	if !key.HasPrefix(indexPrefixSep) {
