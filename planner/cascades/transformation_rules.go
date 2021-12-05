@@ -431,15 +431,19 @@ func NewRulePushSelDownProjection() Transformation {
 }
 
 // OnTransform implements Transformation interface.
+// https://pingcap.com/zh/blog/tidb-source-code-reading-7
+// 能向下推的尽量下推，完全推下去对应情况1，部分推不下去对应情况2，完全推不下去对应情况3
 // It will transform `selection -> projection -> x` to
 // 1. `projection -> selection -> x` or
 // 2. `selection -> projection -> selection -> x` or
 // 3. just keep unchanged.
+// 谓词下推规则与setvar、getvar示例：https://docs.pingcap.com/zh/tidb/v5.2/predicate-push-down#%E8%B0%93%E8%AF%8D%E4%B8%8B%E6%8E%A8
 func (r *PushSelDownProjection) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	sel := old.GetExpr().ExprNode.(*plannercore.LogicalSelection)
 	proj := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalProjection)
 	projSchema := old.Children[0].Prop.Schema
 	childGroup := old.Children[0].GetExpr().Children[0]
+	// 避免将包含getvar和setvar的语句下推
 	for _, expr := range proj.Exprs {
 		if expression.HasAssignSetVarFunc(expr) {
 			return nil, false, false, nil
@@ -493,9 +497,70 @@ func NewRulePushSelDownAggregation() Transformation {
 // OnTransform implements Transformation interface.
 // It will transform `sel->agg->x` to `agg->sel->x` or `sel->agg->sel->x`
 // or just keep the selection unchanged.
+// 与上面的proj流程进行对比,主要区别是判断条件的区别
 func (r *PushSelDownAggregation) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the algo according to the header comment.
-	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
+	sel := old.GetExpr().ExprNode.(*plannercore.LogicalSelection)
+	agg := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+	aggSchema := old.Children[0].Prop.Schema
+	childGroup := old.Children[0].GetExpr().Children[0]
+	canBePushed := make([]expression.Expression, 0, len(sel.Conditions))
+	canNotBePushed := make([]expression.Expression, 0, len(sel.Conditions))
+	// 获得agg用到的全部列，以判断是否可以下推
+	// 封装起来避免后面双重for循环比对
+	groupByColumns := expression.NewSchema(agg.GetGroupByCols()...)
+	for _, cond := range sel.Conditions {
+		switch cond.(type) {
+		// 边界情况，开始没注意到
+		case *expression.Constant:
+			// Consider SQL list "select sum(b) from t group by a having 1=0". "1=0" is a constant predicate which should be
+			// retained and pushed down at the same time. Because we will get a wrong query result that contains one column
+			// with value 0 rather than an empty query result.
+			canBePushed = append(canBePushed, cond)
+			canNotBePushed = append(canNotBePushed, cond)
+		case *expression.ScalarFunction:
+			// 判断列是否一致
+			extractColumns := expression.ExtractColumns(cond)
+			// 规则：只要 Selection 当中的一个 Expression 里的所有列都出现在 group by 的分组列时，
+			// 我们就可以把这个 Expression 进行下推。
+			findAll := true
+			for _, curColumn := range extractColumns {
+				if !groupByColumns.Contains(curColumn) {
+					findAll = false
+					break
+				}
+			}
+			if findAll {
+				// 所有col都在group col里,则可以下推
+				canBePushed = append(canBePushed,cond)
+			} else {
+				canNotBePushed = append(canNotBePushed,cond)
+			}
+		default:
+			// 特殊情况保险起见不下推了
+			canNotBePushed = append(canNotBePushed,cond)
+		}
+	}
+	// 如果没有任何可以下推的表达式，直接返回(情况3)
+	if len(canBePushed) == 0 {
+		return nil, false, false, nil
+	}
+	newBottomSel := plannercore.LogicalSelection{Conditions: canBePushed}.Init(sel.SCtx())
+	newBottomSelExpr := memo.NewGroupExpr(newBottomSel)
+	newBottomSelExpr.SetChildren(childGroup)
+	newBottomSelGroup := memo.NewGroupWithSchema(newBottomSelExpr, childGroup.Prop.Schema)
+	newAggExpr := memo.NewGroupExpr(agg)
+	newAggExpr.SetChildren(newBottomSelGroup)
+	if len(canNotBePushed) == 0 {
+		// 情况1
+		return []*memo.GroupExpr{newAggExpr}, true, false, nil
+	}
+	aggGroup := memo.NewGroupWithSchema(newAggExpr, aggSchema)
+	newTopSel := plannercore.LogicalSelection{Conditions: canNotBePushed}.Init(sel.SCtx())
+	newTopSelGroupExpr := memo.NewGroupExpr(newTopSel)
+	newTopSelGroupExpr.SetChildren(aggGroup)
+	// 情况2
+	return []*memo.GroupExpr{newTopSelGroupExpr}, true, false, nil
 }
 
 // TransformLimitToTopN transforms Limit+Sort to TopN.
@@ -798,5 +863,32 @@ func (r *MergeAggregationProjection) Match(old *memo.ExprIter) bool {
 // It will transform `Aggregation->Projection->X` to `Aggregation->X`.
 func (r *MergeAggregationProjection) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the body according to the header comment.
-	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
+	// 对应projection的列与全部的列一致？
+	oldAgg := old.GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+	proj := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalProjection)
+	projSchema := old.Children[0].GetExpr().Schema()
+
+	groupByItems := make([]expression.Expression, len(oldAgg.GroupByItems))
+	for i, item := range oldAgg.GroupByItems {
+		groupByItems[i] = expression.ColumnSubstitute(item, projSchema, proj.Exprs)
+	}
+
+	aggFuncs := make([]*aggregation.AggFuncDesc, len(oldAgg.AggFuncs))
+	for i, aggFunc := range oldAgg.AggFuncs {
+		aggFuncs[i] = aggFunc.Clone()
+		newArgs := make([]expression.Expression, len(aggFunc.Args))
+		for j, arg := range aggFunc.Args {
+			newArgs[j] = expression.ColumnSubstitute(arg, projSchema, proj.Exprs)
+		}
+		aggFuncs[i].Args = newArgs
+	}
+
+	newAgg := plannercore.LogicalAggregation{
+		GroupByItems: groupByItems,
+		AggFuncs:     aggFuncs,
+	}.Init(oldAgg.SCtx())
+
+	newAggExpr := memo.NewGroupExpr(newAgg)
+	newAggExpr.SetChildren(old.Children[0].GetExpr().Children...)
+	return []*memo.GroupExpr{newAggExpr}, true, false, nil
 }

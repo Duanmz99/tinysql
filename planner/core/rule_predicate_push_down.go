@@ -352,11 +352,40 @@ func (p *LogicalProjection) PredicatePushDown(predicates []expression.Expression
 }
 
 // PredicatePushDown implements LogicalPlan PredicatePushDown interface.
+// 一定会变好的规则性调整
 func (la *LogicalAggregation) PredicatePushDown(predicates []expression.Expression) (ret []expression.Expression, retPlan LogicalPlan) {
 	// TODO: Here you need to push the predicates across the aggregation.
 	//       A simple example is that `select * from (select count(*) from t group by b) tmp_t where b > 1` is the same with
 	//       `select * from (select count(*) from t where b > 1 group by b) tmp_t.
-	return predicates, la
+	// 只要 Selection 当中的一个 Expression 里的所有列都出现在 group by 的分组列时，我们就可以把这个 Expression 进行下推。
+	canBePushed := make([]expression.Expression, 0, len(predicates))
+	ret = make([]expression.Expression, 0, len(predicates))
+	groupColumns := la.GetGroupByCols()
+	for _, expr := range predicates {
+		find := false
+		columns := expression.ExtractColumns(expr)
+		// 查看expr的列是否在aggregation的聚合组里，如果全都在的话就可以下推
+		for _, column := range columns {
+			find = false
+			for _, col := range groupColumns {
+				if col == column {
+					find = true
+					break
+				}
+			}
+			if find ==false {
+				// 这个column没找到，这个expr无法下推
+				break
+			}
+		}
+		if find == true {
+			canBePushed = append(canBePushed, expr)
+		} else {
+			ret = append(ret, expr)
+		}
+	}
+	la.baseLogicalPlan.PredicatePushDown(canBePushed)
+	return ret, la
 }
 
 // PredicatePushDown implements LogicalPlan PredicatePushDown interface.
